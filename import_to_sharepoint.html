@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<title>Import Tasks to SharePoint</title>
+<script src="https://unpkg.com/@azure/msal-browser@2.38.3/lib/msal-browser.min.js"></script>
+<style>
+  body{font-family:sans-serif;background:#0d1117;color:#e6edf3;padding:40px;}
+  h1{color:#58a6ff;}
+  .btn{background:#238636;color:white;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;font-size:14px;margin:6px 4px;}
+  .btn:hover{background:#2ea043;}
+  .btn-blue{background:#1f6feb;}.btn-blue:hover{background:#388bfd;}
+  .btn-red{background:#da3633;}.btn-red:hover{background:#f85149;}
+  .log{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:16px;margin-top:20px;max-height:400px;overflow-y:auto;font-family:monospace;font-size:12px;line-height:1.6;}
+  .ok{color:#3fb950;}.err{color:#f85149;}.info{color:#58a6ff;}.warn{color:#d29922;}
+  table{width:100%;border-collapse:collapse;font-size:11px;margin-top:16px;}
+  th{background:#1f2937;padding:6px 8px;text-align:left;color:#9ca3af;border:1px solid #374151;}
+  td{padding:4px 7px;border:1px solid #374151;vertical-align:top;}
+  tr:hover td{background:#1a2233;}
+  .badge{display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600;}
+  .bR{background:#fde8e8;color:#c81e1e;}
+  .bP{background:#fef3c7;color:#92400e;}
+  .bG{background:#d1fae5;color:#065f46;}
+  .bB{background:#dbeafe;color:#1e40af;}
+  .bV{background:#ede9fe;color:#5b21b6;}
+  .stats{display:flex;gap:12px;margin:12px 0;flex-wrap:wrap;}
+  .stat{background:#1f2937;border:1px solid #374151;border-radius:6px;padding:8px 14px;text-align:center;}
+  .stat-n{font-size:20px;font-weight:700;font-family:monospace;}
+  .stat-l{font-size:10px;color:#6b7280;margin-top:2px;}
+</style>
+</head>
+<body>
+<h1>📥 Import All Tasks → SharePoint</h1>
+<p style="color:#8b949e;">รวมข้อมูลจาก 3 ไฟล์ · ตรวจสอบและ deduplicate แล้ว</p>
+
+<div class="stats" id="stats-bar"></div>
+
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin:8px 0;">
+  <button class="btn btn-blue" onclick="doLogin()">🔐 Login Microsoft</button>
+  <button class="btn btn-red" onclick="doDeleteAll()">🗑 ลบทั้งหมดก่อน</button>
+  <button class="btn" onclick="doImport()">🚀 Import ทั้งหมด (<span id="total-cnt">0</span> tasks)</button>
+  <button class="btn" style="background:#6b21a8;" onclick="doDeleteThenImport()">⚡ ลบเก่า + Import ใหม่ (แนะนำ)</button>
+  <button class="btn btn-red" onclick="clearLog()">✕ ล้าง Log</button>
+</div>
+
+<div class="log" id="log"><span class="info">รอ Login ก่อนครับ...</span></div>
+
+<h3 style="margin-top:24px;color:#e6edf3;">📋 รายการทั้งหมด (<span id="task-count">0</span> tasks)</h3>
+<div style="overflow-x:auto;">
+<table id="task-table">
+  <thead><tr>
+    <th>#</th><th>ชื่องาน</th><th>Type</th><th>P</th>
+    <th>Start</th><th>Due</th><th>Status</th><th>Team</th>
+    <th>Note</th><th>✅ Done Subtasks</th><th>⬜ Pending Subtasks</th>
+  </tr></thead>
+  <tbody id="task-tbody"></tbody>
+</table>
+</div>
+
+<script>
+var SP={clientId:'9c872787-a9e3-4aee-8c9a-f334044e6b4c',tenantId:'33021451-82a3-41cd-b43e-baf144e67483',siteUrl:'https://costplan1.sharepoint.com/sites/IT760',listName:'IT_Tasks'};
+var SCOPES=['https://graph.microsoft.com/Sites.ReadWrite.All'];
+var msalApp=null,token=null,siteId=null,listId=null;
+
+function initMsal(){if(typeof msal==='undefined'){setTimeout(initMsal,100);return;}
+  msalApp=new msal.PublicClientApplication({auth:{clientId:SP.clientId,authority:'https://login.microsoftonline.com/'+SP.tenantId,redirectUri:window.location.href.split('?')[0]},cache:{cacheLocation:'localStorage'}});
+  log('info','✅ MSAL พร้อม');}
+window.addEventListener('load',initMsal);
+
+function log(t,m){var el=document.getElementById('log');el.innerHTML+='<div class="'+t+'">'+m+'</div>';el.scrollTop=el.scrollHeight;}
+function clearLog(){document.getElementById('log').innerHTML='';}
+
+async function gfetch(path,method,body){
+  var opts={method:method||'GET',headers:{'Authorization':'Bearer '+token,'Content-Type':'application/json'}};
+  if(body)opts.body=JSON.stringify(body);
+  var res=await fetch('https://graph.microsoft.com/v1.0'+path,opts);
+  if(!res.ok)throw new Error('HTTP '+res.status+': '+await res.text());
+  return res.status===204?null:res.json();
+}
+
+async function doLogin(){
+  try{
+    log('info','🔐 Login...');
+    var acc=msalApp.getAllAccounts();
+    var r=acc.length>0?await msalApp.acquireTokenSilent({scopes:SCOPES,account:acc[0]}):await msalApp.acquireTokenPopup({scopes:SCOPES});
+    token=r.accessToken;
+    log('ok','✅ '+msalApp.getAllAccounts()[0].username);
+    var h=new URL(SP.siteUrl).hostname, p=new URL(SP.siteUrl).pathname;
+    var sd=await gfetch('/sites/'+h+':'+p);
+    siteId=sd.id; log('ok','✅ Site OK');
+    var ls=await gfetch('/sites/'+siteId+'/lists?$filter=displayName eq \''+SP.listName+'\'');
+    if(!ls.value.length){log('err','❌ ไม่พบ List');return;}
+    listId=ls.value[0].id; log('ok','✅ List OK');
+    log('ok','🎉 พร้อม Import!');
+  }catch(e){log('err','❌ '+e.message);}
+}
+
+async function doImport(){
+  if(!token||!siteId||!listId){log('err','❌ Login ก่อนครับ');return;}
+  log('info','🚀 เริ่ม Import '+TASKS.length+' tasks...');
+  var ok=0,fail=0;
+  for(var i=0;i<TASKS.length;i++){
+    var t=TASKS[i];
+    try{
+      await gfetch('/sites/'+siteId+'/lists/'+listId+'/items','POST',{fields:{
+        Title:t.name,TaskType:t.type,Priority:t.priority,
+        StartDate:t.start||null,DueDate:t.due||null,
+        Status:t.status,Team:t.team,ActionBy:t.by||'Noon',
+        Note:t.note||'',Value:t.value||null,ValueNote:t.valueNote||'',
+        Subtasks:JSON.stringify(t.subtasks||[])
+      }});
+      log('ok','✅ ('+(i+1)+'/'+TASKS.length+') '+t.name); ok++;
+    }catch(e){log('err','❌ ('+(i+1)+'/'+TASKS.length+') '+t.name+' — '+e.message); fail++;}
+    await new Promise(function(r){setTimeout(r,300);});
+  }
+  log(fail===0?'ok':'warn','🏁 เสร็จ! สำเร็จ: '+ok+' | ล้มเหลว: '+fail);
+}
+
+async function doDeleteAll(){
+  if(!token||!siteId||!listId){log('err','❌ Login ก่อนครับ');return;}
+  log('info','🗑 กำลังดึงรายการทั้งหมด...');
+  try{
+    var all=[],url='/sites/'+siteId+'/lists/'+listId+'/items?$select=id&$top=500';
+    while(url){
+      var data=await gfetch(url);
+      all=all.concat(data.value);
+      url=data['@odata.nextLink']?data['@odata.nextLink'].replace('https://graph.microsoft.com/v1.0',''):null;
+    }
+    if(all.length===0){log('warn','⚠️ ไม่มีข้อมูลให้ลบ');return;}
+    log('info','🗑 พบ '+all.length+' items — กำลังลบ...');
+    for(var i=0;i<all.length;i++){
+      await gfetch('/sites/'+siteId+'/lists/'+listId+'/items/'+all[i].id,'DELETE');
+      if((i+1)%5===0||i===all.length-1) log('info','🗑 ลบแล้ว '+(i+1)+'/'+all.length);
+      await new Promise(function(r){setTimeout(r,200);});
+    }
+    log('ok','✅ ลบครบ '+all.length+' items แล้ว');
+  }catch(e){log('err','❌ ลบผิดพลาด: '+e.message);}
+}
+
+async function doDeleteThenImport(){
+  if(!token||!siteId||!listId){log('err','❌ Login ก่อนครับ');return;}
+  log('info','⚡ Step 1/2 — ลบข้อมูลเก่า...');
+  await doDeleteAll();
+  log('info','⚡ Step 2/2 — Import ใหม่...');
+  log('info','─────────────────────────────');
+  await doImport();
+}
+
+// ══════════════════════════════════════════════════════════════
+//  [M] IT Monthly Report March 2026 (41 items)
+//  [R] IT Works Plan 2026 Routine
+//  [T] IT Works Plan To-Do items 1.02–1.15
+// Duplicates merged, subtasks split into done/pending
+// ══════════════════════════════════════════════════════════════
+var TASKS = [
+
+  // ─── ROUTINE ──────────────────────────────────────
+  // JANUARY (items 1-4 from Works Plan — Jan already done)
+  {name:'Check CCTV — มกราคม 2026',type:'Routine',priority:'2',start:'2026-01-05',due:'2026-01-05',status:'Done',team:'IT',note:'เปิด app เช็คกล้องทุกตัว ~5 min',value:null,valueNote:'',subtasks:[]},
+  {name:'Check Fortigate — มกราคม 2026',type:'Routine',priority:'2',start:'2026-01-31',due:'2026-01-31',status:'Done',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Check Synology CloudStation — มกราคม 2026',type:'Routine',priority:'2',start:'2026-01-31',due:'2026-02-01',status:'Not Started',team:'IT',note:'เช็ค Sync Synology CloudStation ทั้ง 2 เครื่อง ~20 min',value:null,valueNote:'',subtasks:[]},
+
+  // FEBRUARY
+  {name:'Check CCTV — กุมภาพันธ์ 2026',type:'Routine',priority:'2',start:'2026-02-01',due:'2026-02-02',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Update Notebook Status — กุมภาพันธ์ 2026',type:'Routine',priority:'2',start:'2026-02-02',due:'2026-02-03',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Check Fortigate — กุมภาพันธ์ 2026',type:'Routine',priority:'2',start:'2026-02-03',due:'2026-02-04',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Check Synology CloudStation — กุมภาพันธ์ 2026',type:'Routine',priority:'2',start:'2026-02-04',due:'2026-02-05',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+
+  // MARCH
+  {name:'Check CCTV — มีนาคม 2026',type:'Routine',priority:'2',start:'2026-03-02',due:'2026-03-03',status:'Not Started',team:'IT',note:'เปิด app เช็คกล้องทุกตัว ~5 min',value:null,valueNote:'',subtasks:[]},
+  {name:'Update Notebook Status — มีนาคม 2026',type:'Routine',priority:'2',start:'2026-03-01',due:'2026-03-01',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Check Fortigate — มีนาคม 2026',type:'Routine',priority:'2',start:'2026-03-03',due:'2026-03-04',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Check AutoCAD License — มีนาคม 2026',type:'Routine',priority:'2',start:'2026-03-01',due:'2026-03-31',status:'Not Started',team:'IT',note:'ตรวจสอบ License AutoCAD ประจำเดือน',value:null,valueNote:'',subtasks:[]},
+
+  // APRIL
+  {name:'Check CCTV — เมษายน 2026',type:'Routine',priority:'2',start:'2026-04-01',due:'2026-04-01',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Update Notebook Status — เมษายน 2026',type:'Routine',priority:'2',start:'2026-04-02',due:'2026-04-02',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Check Fortigate — เมษายน 2026',type:'Routine',priority:'1',start:'2026-04-03',due:'2026-04-24',status:'Not Started',team:'IT',note:'Expiry: 18 Apr 2026',value:null,valueNote:'',subtasks:[]},
+
+  // MAY
+  {name:'Check CCTV — พฤษภาคม 2026',type:'Routine',priority:'2',start:'2026-05-01',due:'2026-05-01',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Update Notebook Status — พฤษภาคม 2026',type:'Routine',priority:'2',start:'2026-05-04',due:'2026-05-04',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Check Fortigate — พฤษภาคม 2026',type:'Routine',priority:'2',start:'2026-05-05',due:'2026-05-05',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+
+  // JUNE
+  {name:'Check CCTV — มิถุนายน 2026',type:'Routine',priority:'2',start:'2026-06-01',due:'2026-06-01',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Update Notebook Status — มิถุนายน 2026',type:'Routine',priority:'2',start:'2026-06-02',due:'2026-06-02',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Check Fortigate — มิถุนายน 2026',type:'Routine',priority:'2',start:'2026-06-04',due:'2026-06-04',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Check Synology CloudStation — มิถุนายน 2026',type:'Routine',priority:'2',start:'2026-06-03',due:'2026-06-03',status:'Not Started',team:'IT',note:'เช็ค Sync Synology CloudStation ทั้ง 2 เครื่อง ~20 min',value:null,valueNote:'',subtasks:[]},
+
+  // JULY
+  {name:'Check CCTV — กรกฎาคม 2026',type:'Routine',priority:'2',start:'2026-07-01',due:'2026-07-01',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Update Notebook Status — กรกฎาคม 2026',type:'Routine',priority:'2',start:'2026-07-02',due:'2026-07-02',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Check Fortigate — กรกฎาคม 2026',type:'Routine',priority:'2',start:'2026-07-03',due:'2026-07-03',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+
+  // AUGUST
+  {name:'Check CCTV — สิงหาคม 2026',type:'Routine',priority:'2',start:'2026-08-03',due:'2026-08-03',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Update Notebook Status — สิงหาคม 2026',type:'Routine',priority:'2',start:'2026-08-04',due:'2026-08-04',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Check Fortigate — สิงหาคม 2026',type:'Routine',priority:'2',start:'2026-08-05',due:'2026-08-05',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+
+  // SEPTEMBER
+  {name:'Check CCTV — กันยายน 2026',type:'Routine',priority:'2',start:'2026-09-01',due:'2026-09-01',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Update Notebook Status — กันยายน 2026',type:'Routine',priority:'2',start:'2026-09-02',due:'2026-09-02',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Check Fortigate — กันยายน 2026',type:'Routine',priority:'2',start:'2026-09-15',due:'2026-09-19',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+
+  // OCTOBER
+  {name:'Check CCTV — ตุลาคม 2026',type:'Routine',priority:'2',start:'2026-10-01',due:'2026-10-01',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Update Notebook Status — ตุลาคม 2026',type:'Routine',priority:'2',start:'2026-10-02',due:'2026-10-02',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Check Fortigate — ตุลาคม 2026',type:'Routine',priority:'2',start:'2026-10-05',due:'2026-10-05',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+
+  // NOVEMBER
+  {name:'Check CCTV — พฤศจิกายน 2026',type:'Routine',priority:'2',start:'2026-11-02',due:'2026-11-02',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Update Notebook Status — พฤศจิกายน 2026',type:'Routine',priority:'2',start:'2026-11-03',due:'2026-11-03',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Check Fortigate — พฤศจิกายน 2026',type:'Routine',priority:'2',start:'2026-11-04',due:'2026-11-04',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+
+  // DECEMBER
+  {name:'Check CCTV — ธันวาคม 2026',type:'Routine',priority:'2',start:'2026-12-01',due:'2026-12-01',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Update Notebook Status — ธันวาคม 2026',type:'Routine',priority:'2',start:'2026-12-02',due:'2026-12-02',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Check Fortigate — ธันวาคม 2026',type:'Routine',priority:'2',start:'2026-12-03',due:'2026-12-03',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+
+  // ─── SUBSCRIPTION ─────────────────────────────────
+  // ข้อ 15+16 แยกเป็น 2 tasks
+  {name:'Email Hosting Renewal — costplan.co.th',type:'Subscription',priority:'1',start:'2026-03-09',due:'2026-03-13',status:'Done',team:'IT',note:'Expiry: 31 Mar 2026',value:26400,valueNote:'Email Plus Extra 100',
+    subtasks:[{label:'ทำเรื่องอนุมัติกับหัวหน้า',done:true},{label:'ส่งต่อ Admin',done:true},{label:'ส่งต่อ Accountant',done:true}]},
+  {name:'Web Hosting Renewal — costplan.co.th',type:'Subscription',priority:'1',start:'2026-03-09',due:'2026-03-13',status:'Not Started',team:'IT',note:'Expiry: 31 Mar 2026',value:1800,valueNote:'Web Hosting Plus/Linux 100MB',
+    subtasks:[{label:'ทำเรื่องอนุมัติ',done:false},{label:'ส่งต่อ Admin',done:false},{label:'ส่งต่อ Accountant',done:false}]},
+  {name:'Zoom Subscription Renewal — 3 Accounts',type:'Subscription',priority:'2',start:'2026-03-15',due:'2026-03-23',status:'Not Started',team:'IT',note:'Expiry: March 2026',value:null,valueNote:'Zoom 3 Accounts',subtasks:[]},
+  {name:'Zoom Subscription Renewal — 1 Account',type:'Subscription',priority:'2',start:'2026-04-22',due:'2026-04-22',status:'Not Started',team:'IT',note:'Expiry: April 2026',value:null,valueNote:'Zoom 1 Account',subtasks:[]},
+  {name:'Fortigate UTM Subscription Renewal',type:'Subscription',priority:'1',start:'2026-04-03',due:'2026-04-18',status:'Not Started',team:'IT',note:'Expiry: 18 Apr 2026',value:null,valueNote:'FortiGate UTM Subscription',subtasks:[]},
+  {name:'Microsoft 365 — 6 Licenses Renewal',type:'Subscription',priority:'1',start:'2026-09-14',due:'2026-09-18',status:'Not Started',team:'IT',note:'Expiry: 30 Sep 2026',value:18720,valueNote:'MS Office 365 Business Basic 6 users',subtasks:[]},
+  {name:'Microsoft 365 — ซื้อเพิ่ม 2 Licenses',type:'Subscription',priority:'2',start:'2026-02-23',due:'2026-03-04',status:'Done',team:'IT',note:'สำหรับ Accounting / Sales & Marketing แชร์ข้อมูลผู้บริหาร',value:null,valueNote:'MS365 Business Basic 2 Licenses',
+    subtasks:[{label:'ทำเรื่องสั่งซื้อ',done:true},{label:'Assign Licenses ให้ Sales & Marketing',done:true},{label:'สร้าง OneDrive ให้ Accountant และ Sales',done:true},{label:'แจ้งผู้บริหาร',done:true}]},
+
+  // ─── IT SUPPORT ───────────────────────────────────
+  {name:'CostX — License ไม่พอใช้งาน',type:'Support',priority:'1',start:'2025-12-24',due:'2026-03-31',status:'On Process',team:'Team Prang',note:'Benz, Prang, Joom, Sak ใช้ไม่พอ',value:null,valueNote:'',
+    subtasks:[{label:'แจ้ง Zoom & Email',done:true},{label:'แจ้งในที่ประชุม',done:true},{label:'เติม License เพิ่ม',done:false}]},
+  {name:'Notebook Art — เพิ่ม RAM 12-16GB',type:'Support',priority:'3',start:'2025-12-24',due:'2026-04-30',status:'Not Started',team:'Team Prang',note:'RAM ปัจจุบัน 8GB',value:null,valueNote:'',subtasks:[]},
+  {name:'Notebook Pond — พัดลมดัง',type:'Support',priority:'3',start:'2025-12-24',due:'2026-04-30',status:'Not Started',team:'Team Prang',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Pond — ติดตั้ง Revit Viewer',type:'Support',priority:'2',start:'2025-12-24',due:'2026-03-31',status:'Not Started',team:'Team Prang',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Notebook Meen — Adaptor หลวม',type:'Support',priority:'2',start:'2025-12-24',due:'2026-03-31',status:'Not Started',team:'Team Joom',note:'อาจต้องเปลี่ยน Adaptor',value:null,valueNote:'',subtasks:[]},
+  {name:'แกม — แปลงไฟล์เป็น PDF ช้า',type:'Support',priority:'2',start:'2025-12-24',due:'2026-03-31',status:'Not Started',team:'Team Pair',note:'ล้างเครื่อง',value:null,valueNote:'',subtasks:[]},
+  {name:'Excel ไฟล์ค้างดับบ่อย — Team Pair',type:'Support',priority:'1',start:'2025-12-24',due:'2026-03-31',status:'Not Started',team:'Team Pair',note:'แก้ปัญหาที่ต้นฉบับ Excel',value:null,valueNote:'',subtasks:[]},
+  {name:'Notebook อร — เปลี่ยนแบตเตอรี่',type:'Support',priority:'1',start:'2026-01-06',due:'2026-02-13',status:'Done',team:'Team Sak',note:'เปลี่ยนแบต',value:null,valueNote:'',
+    subtasks:[{label:'เขียนใบสั่งซื้อ',done:true},{label:'ให้พี่เซ็น',done:true},{label:'รับแบตและเปลี่ยน',done:true}]},
+  {name:'CCTV สวน — ไม่มีภาพ',type:'Support',priority:'1',start:'2026-01-05',due:'2026-01-06',status:'Done',team:'IT',note:'Adaptor พัง เปลี่ยน Adaptor ใหม่',value:null,valueNote:'',
+    subtasks:[{label:'โทรนัดช่าง',done:true},{label:'เปลี่ยน Adaptor',done:true}]},
+  {name:'Set Print สีโควต้า 100 แผ่น/เดือน — Team Post',type:'Support',priority:'3',start:'2026-01-05',due:'2026-01-05',status:'Done',team:'Team Post',note:'ปราง, แพร, จุ๋ม, ศักดิ์',value:null,valueNote:'',subtasks:[]},
+  {name:'Google Map — รายละเอียดโครงการเก่า',type:'Support',priority:'1',start:'2026-01-07',due:'2026-04-30',status:'Not Started',team:'Sales & Marketing',note:'',value:null,valueNote:'',
+    subtasks:[{label:'หาข้อมูลใน Server',done:false},{label:'List รายชื่อโครงการทั้งหมด',done:false},{label:'ปักหมุดใน Google Map',done:false}]},
+  {name:'ศึกษาการใช้ CostX ให้ครบ 100%',type:'Support',priority:'2',start:'2026-01-01',due:'2026-06-30',status:'Not Started',team:'BOQ',note:'ปัจจุบันใช้งานอยู่ที่ 30%',value:null,valueNote:'',
+    subtasks:[{label:'ศึกษา Feature ที่ยังไม่ใช้',done:false},{label:'จัดทำคู่มือ',done:false},{label:'Training ทีม BOQ',done:false}]},
+
+  // ─── PROJECT / SYSTEM DEV ─────────────────────────
+  {name:'ระบบ Assign งาน TOR & Contract',type:'Project',priority:'1',start:'2025-11-18',due:'2025-11-27',status:'Done',team:'TOR & Contract',note:'MS Form → MS List',value:null,valueNote:'',
+    subtasks:[{label:'สร้าง MS Form และตาราง',done:true},{label:'ตั้ง Email ตอบกลับอัตโนมัติ',done:true},{label:'แนบคู่มือออกทาง Email',done:true}]},
+  {name:'ระบบ Assign งาน BOQ',type:'Project',priority:'1',start:'2025-12-22',due:'2026-01-16',status:'Done',team:'BOQ',note:'MS Form → MS List',value:null,valueNote:'',
+    subtasks:[{label:'สร้าง MS Form และตาราง',done:true},{label:'ส่งคู่มือออกทาง Email',done:true}]},
+  {name:'ระบบ Assign งาน Procurement',type:'Project',priority:'3',start:'2025-12-23',due:'2026-03-20',status:'On Process',team:'Procurement',note:'ปรับตาม Comment',value:null,valueNote:'',
+    subtasks:[{label:'สร้าง MS Form และตาราง',done:true},{label:'แก้ไข Form ตาม Comment',done:true},{label:'แก้ Team Post รับ Status Done',done:false},{label:'ทดสอบระบบ',done:false}]},
+  {name:'BOQ AR&ID — MS Project Workload Tracking',type:'Project',priority:'1',start:'2026-01-07',due:'2026-01-12',status:'Done',team:'BOQ',note:'Planning vs Actual Workload',value:null,valueNote:'',
+    subtasks:[{label:'สร้าง MS Project Form ให้ยิ้มอัปเดต',done:true},{label:'ฟังประชุม 9/1/26',done:true},{label:'เลือกโปรแกรม MS Project',done:true},{label:'ลง MS Project เครื่อง',done:true}]},
+  {name:'Claude in Excel — AI Tender Comparison (Development)',type:'Project',priority:'1',start:'2026-01-26',due:'2026-03-31',status:'On Process',team:'IT',note:'ทดลองทำ Comparison, Highlight, Summary, Variance',value:null,valueNote:'',
+    subtasks:[{label:'Phase 1: กำหนดรูปแบบไฟล์',done:true},{label:'Phase 2: AI Highlight ความต่าง >10%',done:true},{label:'Phase 2: วิเคราะห์แนวโน้มราคา',done:true},{label:'Phase 2: สรุปและข้อเสนอแนะ',done:true},{label:'Phase 3: Automation/Script',done:false},{label:'Phase 3: UI ผู้ใช้ทั่วไป',done:false},{label:'Phase 4: Testing',done:false}]},
+  {name:'Claude for Excel — HIS Tender Comparison MEP No.1',type:'Project',priority:'1',start:'2026-02-24',due:'2026-02-27',status:'Done',team:'Team Post',note:'Summary & Analysis',value:null,valueNote:'',subtasks:[]},
+  {name:'Claude for Excel — HIS Tender Comparison Main Contractor No.3',type:'Project',priority:'1',start:'2026-03-04',due:'2026-03-04',status:'Done',team:'Team Post',note:'Summary & Analysis',value:null,valueNote:'',subtasks:[]},
+  {name:'Claude for Excel — Proton Tender Comparison Main Contractor & MEP No.1',type:'Project',priority:'1',start:'2026-03-04',due:'2026-03-04',status:'Done',team:'Team Post',note:'Summary & Analysis',value:null,valueNote:'',subtasks:[]},
+  {name:'AI Contract Assistant',type:'Project',priority:'2',start:'2025-07-24',due:'2026-06-30',status:'Not Started',team:'IT',note:'Phase 1-3: Planning → Dev → Testing',value:null,valueNote:'',
+    subtasks:[{label:'Phase 1: รวบรวม Requirements',done:false},{label:'Phase 2: สร้าง Contract Template',done:false},{label:'Phase 2: สร้างข้อความสัญญาด้วย AI',done:false},{label:'Phase 2: สร้างแบบฟอร์มรวบรวมข้อมูล',done:false},{label:'Phase 2: กรอกและแทนที่อัตโนมัติ',done:false},{label:'Phase 2: Export DOCX/PDF',done:false},{label:'Phase 3: Testing',done:false}]},
+  {name:'ระบบจองห้องประชุม 104, 105',type:'Project',priority:'2',start:'2026-01-20',due:'2026-04-30',status:'On Process',team:'IT',note:'',value:null,valueNote:'',
+    subtasks:[{label:'ออกแบบระบบ',done:true},{label:'พัฒนาระบบจอง',done:false},{label:'ทดสอบ',done:false}]},
+  {name:'2-Way Communication — Account Team',type:'Project',priority:'2',start:'2026-01-20',due:'2026-05-31',status:'Not Started',team:'Account',note:'สั่งซื้อของ, สอบถามปัญหา, เช็คโปรเกรสงาน',value:null,valueNote:'',subtasks:[]},
+  {name:'2-Way Communication — Admin Team',type:'Project',priority:'2',start:'2026-01-20',due:'2026-05-31',status:'Not Started',team:'Admin',note:'สั่งซื้อของ, สอบถามปัญหา, เช็คโปรเกรสงาน',value:null,valueNote:'',subtasks:[]},
+  {name:'Format Blank BOQ',type:'Project',priority:'2',start:'2026-01-22',due:'2026-04-30',status:'Not Started',team:'BOQ',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'ปรับตาราง Fee Proposal Report',type:'Project',priority:'1',start:'2026-01-28',due:'2026-01-28',status:'Done',team:'Sales & Marketing',note:'',value:null,valueNote:'',
+    subtasks:[{label:'แชร์ไฟล์และ Lock',done:true},{label:'แจ้ง Update ทาง Email',done:true},{label:'Click link เข้าสัญญา',done:true},{label:'Click link Google Earth',done:true},{label:'ย้าย Sum Status มาด้านหน้า',done:true}]},
+  {name:'Upload Job Description Online',type:'Project',priority:'2',start:'2026-01-28',due:'2026-03-31',status:'On Process',team:'HR',note:'แปะ JD บน Job Boards',value:null,valueNote:'',
+    subtasks:[{label:'จัดทำ JD ให้ครบ',done:true},{label:'แปะบนเว็บ Job Board',done:false}]},
+  {name:'ตั้งชื่อไฟล์ Quotation — เพิ่ม Code Material',type:'Project',priority:'2',start:'2026-02-02',due:'2026-04-30',status:'Not Started',team:'Procurement',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Quotation แปะบน Mind Map',type:'Project',priority:'3',start:'2026-02-02',due:'2026-04-30',status:'Not Started',team:'Procurement',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'จัดทำประกาศใน Humansoft',type:'Project',priority:'1',start:'2026-01-14',due:'2026-01-23',status:'Done',team:'HR',note:'',value:null,valueNote:'',
+    subtasks:[{label:'ทดลองสร้างประกาศ',done:true},{label:'สอน HR สร้างประกาศ',done:true}]},
+  {name:'Humansoft OT — Flow การอนุมัติ',type:'Project',priority:'2',start:'2026-01-19',due:'2026-01-21',status:'Done',team:'HR',note:'เงื่อนไข OT และระดับการอนุมัติ',value:null,valueNote:'',
+    subtasks:[{label:'วิเคราะห์เงื่อนไข OT',done:true},{label:'แปลงเป็นวันหยุดพิเศษ',done:true},{label:'สร้าง Flow การอนุมัติ',done:true}]},
+  {name:'AutoCAD — Assign 5 Licenses ให้ Team Post',type:'Project',priority:'2',start:'2026-01-12',due:'2026-01-12',status:'Done',team:'IT',note:'Assign 5 licenses ให้ Team Post, BOQ ใช้ร่วม',value:null,valueNote:'',subtasks:[]},
+  {name:'Sales + Account CRM — ศึกษา ERP Odoo',type:'Project',priority:'2',start:'2026-01-14',due:'2026-06-30',status:'Not Started',team:'Sales & Marketing',note:'ข้อมูลโครงการ Online สำหรับ Team Fee',value:null,valueNote:'',
+    subtasks:[{label:'ศึกษา ERP Odoo',done:false},{label:'รวบรวม Requirements',done:false},{label:'เปรียบเทียบ Vendor',done:false}]},
+
+  // ─── FROM TO-DO 1.02-1.15 (not duplicate) ─────────
+  {name:'QS ในอีก 2-3 ปี จะเป็นแบบไหน',type:'Project',priority:'3',start:'2025-08-05',due:'2026-12-31',status:'Not Started',team:'IT',note:'วิเคราะห์ทิศทาง QS อนาคต',value:null,valueNote:'',subtasks:[]},
+  {name:'Workload Team BOQ — ติดตาม',type:'Project',priority:'2',start:'2025-09-10',due:'2026-03-31',status:'On Process',team:'BOQ',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Cost Data — วิเคราะห์ต้นทุนต่อ GFA (Cost/m²)',type:'Project',priority:'2',start:'2025-11-19',due:'2026-06-30',status:'Not Started',team:'BOQ',note:'สร้าง Template + Copilot Dashboard',value:null,valueNote:'',
+    subtasks:[{label:'สร้าง Template สำหรับกรอกข้อมูล',done:false},{label:'สร้างวิธีแชร์ให้ทีมกรอก รวมเป็นที่เดียว',done:false},{label:'เขียน Prompts ให้ Copilot ทำ Pivot/Dashboard',done:false},{label:'ทดสอบการใช้งาน',done:false},{label:'แชร์ให้ทีม BOQ กรอก',done:false},{label:'สอน Prompt ให้ทีม BOQ',done:false}]},
+  {name:'ป้อนข้อมูลบริษัท — Company Profile, Project List เข้า AI',type:'Project',priority:'3',start:'2025-11-26',due:'2026-06-30',status:'Not Started',team:'IT',note:'Gemini, ChatGPT',value:null,valueNote:'',subtasks:[]},
+  {name:'ตรวจสอบแก้ไข Procurement OneDrive',type:'Project',priority:'2',start:'2025-12-11',due:'2026-03-31',status:'Not Started',team:'Procurement',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'AI — วิเคราะห์การใช้งานใน Office',type:'Project',priority:'1',start:'2026-01-09',due:'2026-03-31',status:'Not Started',team:'IT',note:'ตีกรอบเพื่อนำไปคุยกับผู้บริหาร',value:null,valueNote:'',subtasks:[]},
+  {name:'Basecamp — ประเมินการใช้งาน',type:'Project',priority:'3',start:'2025-08-11',due:'2026-06-30',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+  {name:'Click Up — ประเมินการใช้งาน',type:'Project',priority:'3',start:'2025-10-27',due:'2026-06-30',status:'Not Started',team:'IT',note:'',value:null,valueNote:'',subtasks:[]},
+];
+
+// ── Render ──────────────────────────────────────────
+function renderTable(){
+  document.getElementById('task-count').textContent = TASKS.length;
+  document.getElementById('total-cnt').textContent  = TASKS.length;
+  var tc = {Routine:'bB',Subscription:'bV',Support:'bR',Project:'bG'};
+  var sc = {Done:'bG','On Process':'bP','Not Started':''};
+  var rows = TASKS.map(function(t,i){
+    var ds = t.subtasks.filter(function(s){return s.done;}).map(function(s){return '✅ '+s.label;}).join('<br>');
+    var ps = t.subtasks.filter(function(s){return !s.done;}).map(function(s){return '⬜ '+s.label;}).join('<br>');
+    return '<tr>'
+      +'<td style="color:#6b7280;">'+(i+1)+'</td>'
+      +'<td style="font-weight:500;max-width:200px;">'+t.name+'</td>'
+      +'<td><span class="badge '+(tc[t.type]||'')+'">'+t.type+'</span></td>'
+      +'<td style="text-align:center;">'+t.priority+'</td>'
+      +'<td style="white-space:nowrap;">'+(t.start||'—')+'</td>'
+      +'<td style="white-space:nowrap;">'+(t.due||'—')+'</td>'
+      +'<td><span class="badge '+(sc[t.status]||'')+'">'+t.status+'</span></td>'
+      +'<td>'+(t.team||'—')+'</td>'
+      +'<td style="color:#9ca3af;max-width:160px;">'+(t.note||'')+'</td>'
+      +'<td style="color:#3fb950;">'+(ds||'—')+'</td>'
+      +'<td style="color:#f59e0b;">'+(ps||'—')+'</td>'
+      +'</tr>';
+  });
+  document.getElementById('task-tbody').innerHTML = rows.join('');
+
+  var s={Routine:0,Subscription:0,Support:0,Project:0,Done:0,'On Process':0,'Not Started':0};
+  TASKS.forEach(function(t){s[t.type]=(s[t.type]||0)+1; s[t.status]=(s[t.status]||0)+1;});
+  document.getElementById('stats-bar').innerHTML =
+    mkStat(TASKS.length,'Total','#58a6ff')+mkStat(s['Done'],'Done','#3fb950')
+    +mkStat(s['On Process'],'On Process','#d29922')+mkStat(s['Not Started'],'Not Started','#9ca3af')
+    +mkStat(s['Routine'],'Routine','#60a5fa')+mkStat(s['Subscription'],'Subscription','#a78bfa')
+    +mkStat(s['Support'],'Support','#f87171')+mkStat(s['Project'],'Project','#34d399');
+}
+
+function mkStat(n,l,c){return '<div class="stat"><div class="stat-n" style="color:'+c+';">'+n+'</div><div class="stat-l">'+l+'</div></div>';}
+renderTable();
+</script>
+</body>
+</html>
